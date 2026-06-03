@@ -34,7 +34,7 @@ pkg install python mpv git termux-api -y
 
 ### 3 — Copy the project to your phone
 
-Option A — USB / file manager: paste the `ytmusic-phone/` folder into your Termux home.
+Option A — USB / file manager: paste the `Phone_Music_Player/` folder into your Termux home.
 The Termux home is at: `/data/data/com.termux/files/home/`
 
 Option B — clone from wherever you're hosting it.
@@ -42,7 +42,7 @@ Option B — clone from wherever you're hosting it.
 ### 4 — Run setup (once)
 
 ```bash
-cd ytmusic-phone
+cd Phone_Music_Player
 python setup.py
 ```
 
