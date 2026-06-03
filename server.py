@@ -27,17 +27,18 @@ state = {
     "shuffle":     True,
     "repeat":      False,
     "error":       None,
-    "loading":     False,
+    "loading":     False, 
 }
 
 play_lock    = threading.Lock()
 player_proc  = None
-ipc_socket   = None
+ipc_socket   = None 
 is_paused    = False
-play_serial  = 0 
+play_serial  = 0
 
 ytm = None
 AUTH_FILE = Path("oauth.json")
+
 
 def mpv_cmd(cmd: dict) -> bool:
     """Send a JSON command to mpv via IPC socket. Returns True on success."""
@@ -89,13 +90,16 @@ def init_ytmusic():
     global ytm
     if not YTM_AVAILABLE:
         return
-    if AUTH_FILE.exists():
-        try:
-            ytm = YTMusic(str(AUTH_FILE))
-            log.info("YTMusic authenticated ✓")
-        except Exception as e:
-            log.error(f"YTMusic auth failed: {e}")
-            ytm = None
+    for candidate in ["browser.json", "oauth.json"]:
+        p = Path(candidate)
+        if p.exists():
+            try:
+                ytm = YTMusic(str(p))
+                log.info(f"YTMusic authenticated via {candidate}")
+                return
+            except Exception as e:
+                log.error(f"Auth failed ({candidate}): {e}")
+    log.warning("No auth file — unauthenticated mode")
 
 def fetch_liked_songs(limit=100):
     if ytm is None: return []
@@ -243,7 +247,7 @@ def play_track(track):
         ]
         player_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         state["playing"] = True
-
+        
     threading.Thread(target=_watcher, args=(my_serial,), daemon=True).start()
     threading.Thread(target=_progress_tracker, args=(my_serial, track.get("duration",0)), daemon=True).start()
 
@@ -258,7 +262,7 @@ def _watcher(serial):
         proc.wait()
     with play_lock:
         if play_serial != serial:
-            return
+            return 
         if is_paused:
             return
     if state["playing"]:
@@ -410,7 +414,7 @@ def api_prev():
 def api_volume():
     vol = max(0, min(100, int(request.json.get("volume", 80))))
     state["volume"] = vol
-    mpv_set_volume(vol)
+    mpv_set_volume(vol) 
     return jsonify({"ok": True, "volume": vol})
 
 @app.route("/api/queue/remove", methods=["POST"])
