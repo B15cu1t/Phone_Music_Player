@@ -68,11 +68,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .ctrl.primary{background:var(--orange);color:#0d0d0d;font-size:24px;border-color:var(--orange);flex:1.4}
 .ctrl.primary:active{background:var(--orange-dim)}
 
-/* volume */
-.vol-row{flex-shrink:0;display:flex;align-items:center;gap:10px}
-.vol-icon{font-size:15px;color:var(--muted);flex-shrink:0}
-input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;background:var(--border);outline:none;cursor:pointer}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--orange)}
 
 /* nav */
 .bottom-nav{flex-shrink:0;display:flex;background:var(--card);border-radius:14px;padding:5px;gap:3px;border:1px solid var(--border)}
@@ -170,11 +165,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
     <button class="ctrl" id="btn-rep" title="Repeat">&#x21BA;</button>
   </div>
 
-  <div class="vol-row">
-    <span class="vol-icon">&#x1F508;</span>
-    <input type="range" id="vol" min="0" max="100" value="80">
-    <span class="vol-icon">&#x1F50A;</span>
-  </div>
 </div>
 
 <!-- QUEUE -->
@@ -219,7 +209,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
 </div>
 
 <script>
-var cur={},pillT=null,volT=null,searchT=null;
+var cur={},pillT=null,searchT=null;
 
 var $=function(id){return document.getElementById(id)};
 
@@ -287,9 +277,6 @@ function updateUI(d){
   $('btn-shuf').classList.toggle('on',!!d.shuffle);
   $('btn-rep').classList.toggle('on',!!d.repeat);
 
-  // vol
-  if(document.activeElement!==$('vol')) $('vol').value=d.volume;
-
   // account
   $('btn-acct').textContent=d.ytm_auth?'\u2713':'\uD83D\uDC64';
   $('btn-acct').title=d.ytm_auth?'Signed in to YouTube Music':'No account (unauthenticated)';
@@ -316,10 +303,6 @@ $('btn-rep').addEventListener('click',async function(){
 });
 $('btn-refresh').addEventListener('click',async function(){ pill('refreshing queue...'); await api('queue/refresh','POST'); });
 $('btn-ref-q').addEventListener('click',async function(){ pill('refreshing...'); await api('queue/refresh','POST'); });
-$('vol').addEventListener('input',function(){
-  clearTimeout(volT);
-  volT=setTimeout(function(){ api('volume','POST',{volume:parseInt($('vol').value)}); },300);
-});
 
 // queue render
 function renderQueue(d){
