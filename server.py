@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Biscuit Music Player - server.py
+Fixed: proper mpv IPC socket for pause/resume, one process at a time,
+no auto-start on launch (wait for user to press play), remove from queue.
+"""
 
 import os, json, random, threading, subprocess, time, logging, socket, tempfile
 from pathlib import Path
@@ -17,6 +22,9 @@ log = logging.getLogger("biscuit")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════════
 
 state = {
     "playing":     False,
@@ -28,18 +36,22 @@ state = {
     "shuffle":     True,
     "repeat":      False,
     "error":       None,
-    "loading":     False,
+    "loading":     False,   # true while resolving URL
 }
 
+# one lock to rule them all — prevents double-play
 play_lock    = threading.Lock()
 player_proc  = None
-ipc_socket   = None 
+ipc_socket   = None   # path to mpv IPC socket
 is_paused    = False
-play_serial  = 0
+play_serial  = 0      # increment each play_track call; watcher checks it hasn't changed
 
 ytm = None
 AUTH_FILE = Path("oauth.json")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MPV IPC — send commands to running mpv
+# ═══════════════════════════════════════════════════════════════════════════
 
 def mpv_cmd(cmd: dict) -> bool:
     """Send a JSON command to mpv via IPC socket. Returns True on success."""
@@ -86,6 +98,10 @@ def mpv_get_pos() -> float:
         return float(resp.get("data", 0) or 0)
     except Exception:
         return 0.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# YTMUSIC
+# ═══════════════════════════════════════════════════════════════════════════
 
 def init_ytmusic():
     global ytm
@@ -163,46 +179,72 @@ def _best_thumb(thumbs):
     if not thumbs: return ""
     return max(thumbs, key=lambda t: t.get("width",0), default=thumbs[0]).get("url","")
 
-# Search queries used to seed the queue when there is no account auth.
-# Mix of vibes so the queue feels varied rather than one genre.
-SEED_QUERIES = [
-    "best songs 2024",
-    "top hits right now",
-    "most popular songs this year",
-    "best rock songs",
-    "best rap songs 2024",
-    "chill popular music",
-    "best indie songs",
-    "viral songs 2024",
-]
+def seed_queue_from_track(track, size=30):
+    """
+    Build a queue of similar songs based on a track dict.
+    Uses the artist + title to search for related music — no auth needed.
+    """
+    artist = track.get("artist", "")
+    title  = track.get("title", "")
 
-def build_auto_queue(seed_id=None, size=40):
+    # strip junk like (Official Video), [Lyrics], ft. xyz from title
+    import re
+    clean_title = re.sub(r'[\(\[].*?[\)\]]', '', title).strip()
+    clean_title = re.sub(r'(official|video|lyrics?|audio|ft\.?|feat\.?).*', '', clean_title, flags=re.I).strip()
+
+    queries = []
+    if artist and clean_title:
+        queries.append(f"{artist} {clean_title} similar songs")
+        queries.append(f"songs like {clean_title} {artist}")
+        queries.append(f"{artist} best songs")
+        queries.append(f"{artist} discography")
+    elif artist:
+        queries.append(f"{artist} best songs")
+        queries.append(f"{artist} popular songs")
+        queries.append(f"songs like {artist}")
+    elif clean_title:
+        queries.append(f"songs like {clean_title}")
+        queries.append(clean_title + " similar")
+
+    seen = {track["video_id"]}  # exclude the seed track itself
+    unique = []
+
+    for q in queries:
+        if len(unique) >= size:
+            break
+        results = _ytdlp_search(q, 10)
+        for t in results:
+            if t["video_id"] not in seen and t["duration"] and t["duration"] < 600:
+                seen.add(t["video_id"])
+                unique.append(t)
+
+    random.shuffle(unique)
+    return unique[:size]
+
+def build_auto_queue(seed_track=None, size=40):
+    """Build queue. If we have a seed track, base it on that. Otherwise use YTMusic auth."""
+    if seed_track:
+        return seed_queue_from_track(seed_track, size)
+
+    # try YTMusic auth
     liked   = fetch_liked_songs(50)
     history = fetch_history(30)
-    recs    = fetch_recommendations(seed_id, 20) if seed_id else []
-    pool    = liked + history + recs
+    pool    = liked + history
     seen, unique = set(), []
     for t in pool:
         if t["video_id"] not in seen:
             seen.add(t["video_id"]); unique.append(t)
 
-    # no auth or not enough — fill from yt-dlp search so queue is never empty
-    if len(unique) < 10:
-        log.info("No auth / thin pool — seeding queue from search")
-        queries = SEED_QUERIES.copy()
-        random.shuffle(queries)
-        for q in queries:
-            if len(unique) >= size:
-                break
-            results = _ytdlp_search(q, 10)
-            for t in results:
-                if t["video_id"] not in seen:
-                    seen.add(t["video_id"])
-                    unique.append(t)
+    if unique:
+        random.shuffle(unique)
+        return unique[:size]
 
-    random.shuffle(unique)
-    return unique[:size]
+    # totally unauthenticated and no seed — return empty, wait for user
+    return []
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAYBACK
+# ═══════════════════════════════════════════════════════════════════════════
 
 def resolve_audio_url(video_id):
     try:
@@ -324,14 +366,15 @@ def auto_next():
 
     next_idx = idx + 1
 
-    # refill near end
+    # refill near end — seed from current track
     if next_idx >= len(q) - 5:
-        seed = state["current"]["video_id"] if state["current"] else None
-        more = build_auto_queue(seed_id=seed, size=20)
-        existing = {t["video_id"] for t in q}
-        for t in more:
-            if t["video_id"] not in existing:
-                q.append(t)
+        cur = state["current"]
+        if cur:
+            more = seed_queue_from_track(cur, size=20)
+            existing = {t["video_id"] for t in q}
+            for t in more:
+                if t["video_id"] not in existing:
+                    q.append(t)
 
     if next_idx < len(q):
         state["queue_index"] = next_idx
@@ -340,6 +383,10 @@ def auto_next():
         with play_lock:
             state["playing"] = False
             state["current"] = None
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FLASK API
+# ═══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/state")
 def api_state():
@@ -366,42 +413,47 @@ def api_play():
     vid  = data.get("video_id")
 
     if vid:
+        track = {
+            "video_id":  vid,
+            "title":     data.get("title", "Unknown"),
+            "artist":    data.get("artist", ""),
+            "thumbnail": data.get("thumbnail", ""),
+            "duration":  data.get("duration", 0),
+        }
+        # check if already in queue
         q = state["queue"]
         for i, t in enumerate(q):
             if t["video_id"] == vid:
                 state["queue_index"] = i
                 threading.Thread(target=play_track, args=(t,), daemon=True).start()
+                # still rebuild queue around it in background
+                threading.Thread(target=_rebuild_around, args=(track,), daemon=True).start()
                 return jsonify({"ok": True})
-        track = {
-            "video_id":  vid,
-            "title":     data.get("title","Unknown"),
-            "artist":    data.get("artist",""),
-            "thumbnail": data.get("thumbnail",""),
-            "duration":  data.get("duration", 0),
-        }
-        idx = state["queue_index"]
-        q.insert(idx + 1, track)
-        state["queue_index"] = idx + 1
+        # not in queue — play it and rebuild queue around it
+        state["queue"]       = [track]
+        state["queue_index"] = 0
         threading.Thread(target=play_track, args=(track,), daemon=True).start()
+        threading.Thread(target=_rebuild_around, args=(track,), daemon=True).start()
     else:
         q = state["queue"]
         if not q:
-            state["loading"] = True
-            threading.Thread(target=_init_and_play, daemon=True).start()
+            state["error"] = "Use Search to find a song and start playing."
         else:
             t = q[state["queue_index"]]
             threading.Thread(target=play_track, args=(t,), daemon=True).start()
     return jsonify({"ok": True})
 
-def _init_and_play():
-    q = build_auto_queue(size=40)
-    state["queue"]       = q
+def _rebuild_around(track):
+    """Rebuild the queue around a track while it's already playing."""
+    log.info(f"Building queue around: {track['title']} — {track['artist']}")
+    similar = seed_queue_from_track(track, size=30)
+    if not similar:
+        log.warning("No similar songs found")
+        return
+    # put current track at index 0, similar songs after
+    state["queue"]       = [track] + similar
     state["queue_index"] = 0
-    state["loading"]     = False
-    if q:
-        play_track(q[0])
-    else:
-        state["error"] = "No songs found. Sign in or use Search to play something."
+    log.info(f"Queue rebuilt: {len(similar)} songs after {track['title']}")
 
 @app.route("/api/queue/seed", methods=["POST"])
 def api_seed_queue():
@@ -509,16 +561,11 @@ def api_refresh_queue():
     return jsonify({"ok": True})
 
 def _rebuild_queue(seed=None):
-    q = build_auto_queue(seed_id=seed, size=40)
-    cur_id = state["current"]["video_id"] if state["current"] else None
-    state["queue"] = q
-    # keep current track at index 0 if present
-    if cur_id:
-        for i, t in enumerate(q):
-            if t["video_id"] == cur_id:
-                state["queue_index"] = i
-                return
-    state["queue_index"] = 0
+    cur = state["current"]
+    if cur:
+        _rebuild_around(cur)
+    else:
+        state["error"] = "Play a song first, then refresh to build a queue around it."
 
 @app.route("/api/toggle/shuffle", methods=["POST"])
 def api_shuffle():
@@ -543,8 +590,12 @@ def index():
 def static_files(filename):
     return send_from_directory("static", filename)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     init_ytmusic()
-    log.info("Biscuit ready at http://0.0.0.0:5000")
+    # do NOT auto-start — wait for user to press play
+    log.info("🍪 Biscuit ready at http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
