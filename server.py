@@ -17,6 +17,7 @@ log = logging.getLogger("biscuit")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
+
 state = {
     "playing":     False,
     "current":     None,
@@ -27,7 +28,7 @@ state = {
     "shuffle":     True,
     "repeat":      False,
     "error":       None,
-    "loading":     False, 
+    "loading":     False,
 }
 
 play_lock    = threading.Lock()
@@ -162,6 +163,19 @@ def _best_thumb(thumbs):
     if not thumbs: return ""
     return max(thumbs, key=lambda t: t.get("width",0), default=thumbs[0]).get("url","")
 
+# Search queries used to seed the queue when there is no account auth.
+# Mix of vibes so the queue feels varied rather than one genre.
+SEED_QUERIES = [
+    "best songs 2024",
+    "top hits right now",
+    "most popular songs this year",
+    "best rock songs",
+    "best rap songs 2024",
+    "chill popular music",
+    "best indie songs",
+    "viral songs 2024",
+]
+
 def build_auto_queue(seed_id=None, size=40):
     liked   = fetch_liked_songs(50)
     history = fetch_history(30)
@@ -171,11 +185,24 @@ def build_auto_queue(seed_id=None, size=40):
     for t in pool:
         if t["video_id"] not in seen:
             seen.add(t["video_id"]); unique.append(t)
-    if not unique:
-        log.warning("Queue empty — no auth, no seed. Waiting for user search.")
-    else:
-        random.shuffle(unique)
+
+    # no auth or not enough — fill from yt-dlp search so queue is never empty
+    if len(unique) < 10:
+        log.info("No auth / thin pool — seeding queue from search")
+        queries = SEED_QUERIES.copy()
+        random.shuffle(queries)
+        for q in queries:
+            if len(unique) >= size:
+                break
+            results = _ytdlp_search(q, 10)
+            for t in results:
+                if t["video_id"] not in seen:
+                    seen.add(t["video_id"])
+                    unique.append(t)
+
+    random.shuffle(unique)
     return unique[:size]
+
 
 def resolve_audio_url(video_id):
     try:
@@ -199,6 +226,7 @@ def _kill_player():
             try: player_proc.kill()
             except Exception: pass
         player_proc = None
+    # clean up socket file
     if ipc_socket:
         try: Path(ipc_socket).unlink(missing_ok=True)
         except Exception: pass
@@ -224,6 +252,7 @@ def play_track(track):
     url = resolve_audio_url(track["video_id"])
 
     with play_lock:
+        # if another play_track fired while we were resolving, bail
         if play_serial != my_serial:
             log.info("play_track superseded, bailing")
             return
@@ -234,6 +263,7 @@ def play_track(track):
             threading.Thread(target=auto_next, daemon=True).start()
             return
 
+        # unique IPC socket path
         sock_path = str(Path(tempfile.gettempdir()) / f"biscuit_{my_serial}.sock")
         ipc_socket = sock_path
 
@@ -247,8 +277,10 @@ def play_track(track):
         ]
         player_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         state["playing"] = True
-        
+
+    # watch for natural end
     threading.Thread(target=_watcher, args=(my_serial,), daemon=True).start()
+    # track progress via IPC
     threading.Thread(target=_progress_tracker, args=(my_serial, track.get("duration",0)), daemon=True).start()
 
 def _watcher(serial):
@@ -262,15 +294,15 @@ def _watcher(serial):
         proc.wait()
     with play_lock:
         if play_serial != serial:
-            return 
+            return  # superseded
         if is_paused:
-            return
+            return  # user paused
     if state["playing"]:
         auto_next()
 
 def _progress_tracker(serial, duration):
     """Poll mpv every second for real position."""
-    time.sleep(1)
+    time.sleep(1)  # give mpv time to start
     while True:
         with play_lock:
             if play_serial != serial or not state["playing"] or is_paused:
@@ -292,6 +324,7 @@ def auto_next():
 
     next_idx = idx + 1
 
+    # refill near end
     if next_idx >= len(q) - 5:
         seed = state["current"]["video_id"] if state["current"] else None
         more = build_auto_queue(seed_id=seed, size=20)
@@ -317,7 +350,7 @@ def api_state():
         "paused":     is_paused,
         "loading":    state["loading"],
         "current":    state["current"],
-        "queue":      q[idx:idx+20],
+        "queue":      q[idx:idx+20],   # send more so remove works
         "volume":     state["volume"],
         "progress":   state["progress"],
         "shuffle":    state["shuffle"],
@@ -370,6 +403,30 @@ def _init_and_play():
     else:
         state["error"] = "No songs found. Sign in or use Search to play something."
 
+@app.route("/api/queue/seed", methods=["POST"])
+def api_seed_queue():
+    """Build a fresh queue seeded from a user-supplied vibe/genre string."""
+    vibe = (request.json or {}).get("vibe", "").strip()
+    if not vibe:
+        return jsonify({"ok": False, "error": "no vibe"})
+    def _seed():
+        results = _ytdlp_search(vibe, 20)
+        if not results:
+            state["error"] = f"Nothing found for: {vibe}"
+            return
+        seen = set()
+        unique = []
+        for t in results:
+            if t["video_id"] not in seen:
+                seen.add(t["video_id"]); unique.append(t)
+        random.shuffle(unique)
+        state["queue"]       = unique
+        state["queue_index"] = 0
+        state["error"]       = None
+        play_track(unique[0])
+    threading.Thread(target=_seed, daemon=True).start()
+    return jsonify({"ok": True})
+
 @app.route("/api/pause", methods=["POST"])
 def api_pause():
     global is_paused
@@ -390,6 +447,7 @@ def api_resume():
                 is_paused = False
                 state["playing"] = True
                 return jsonify({"ok": True})
+    # mpv is gone — restart track from beginning
     q   = state["queue"]
     idx = state["queue_index"]
     if idx < len(q):
@@ -414,7 +472,7 @@ def api_prev():
 def api_volume():
     vol = max(0, min(100, int(request.json.get("volume", 80))))
     state["volume"] = vol
-    mpv_set_volume(vol) 
+    mpv_set_volume(vol)  # live update via IPC
     return jsonify({"ok": True, "volume": vol})
 
 @app.route("/api/queue/remove", methods=["POST"])
@@ -428,9 +486,11 @@ def api_remove():
     for i, t in enumerate(q):
         if t["video_id"] == vid:
             q.pop(i)
+            # adjust index if we removed something before current
             if i < idx:
                 state["queue_index"] = max(0, idx - 1)
             elif i == idx:
+                # removed the currently playing track — next will auto-play
                 state["queue_index"] = min(idx, len(q) - 1)
             break
     return jsonify({"ok": True, "queue_len": len(q)})
@@ -452,6 +512,7 @@ def _rebuild_queue(seed=None):
     q = build_auto_queue(seed_id=seed, size=40)
     cur_id = state["current"]["video_id"] if state["current"] else None
     state["queue"] = q
+    # keep current track at index 0 if present
     if cur_id:
         for i, t in enumerate(q):
             if t["video_id"] == cur_id:
@@ -481,6 +542,7 @@ def index():
 @app.route("/static/<path:filename>")
 def static_files(filename):
     return send_from_directory("static", filename)
+
 
 if __name__ == "__main__":
     init_ytmusic()
