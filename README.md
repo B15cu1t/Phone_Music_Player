@@ -15,34 +15,31 @@ No YouTube app. No ads. No Spotify. Just your music.
 
 ---
 
-## Install (first time only)
+## Install & Run
 
 ### 1 — Install Termux
 
-Get Termux from **F-Droid** (not the Play Store version, it's outdated):
-https://f-droid.org/packages/com.termux/
+Get Termux from **F-Droid** (not the Play Store version, it's outdated): https://f-droid.org/packages/com.termux/
 
-Also install **Termux:API** from F-Droid (needed for wake lock):
-https://f-droid.org/packages/com.termux.api/
+Also install **Termux:API** from F-Droid (needed for wake lock): https://f-droid.org/packages/com.termux.api/
 
 ### 2 — Open Termux and run:
 
-```bash
-pkg update && pkg upgrade -y
+```
+pkg update -y
 pkg install python mpv git termux-api -y
 ```
 
-### 3 — Copy the project to your phone
+### 3 — Clone the project
 
-Option A — USB / file manager: paste the `Phone_Music_Player/` folder into your Termux home.
-The Termux home is at: `/data/data/com.termux/files/home/`
-
-Option B — clone from wherever you're hosting it.
-
-### 4 — Run setup (once)
-
-```bash
+```
+git clone https://github.com/B15cu1t/Phone_Music_Player
 cd Phone_Music_Player
+```
+
+### 4 — Run setup (first time only)
+
+```
 python setup.py
 ```
 
@@ -54,12 +51,10 @@ This will:
 > **Without login**: the player still works using YouTube search,
 > but won't have your liked songs or personal recommendations.
 
----
+### 5 — Start the player
 
-## Run
-
-```bash
-bash start.sh
+```
+python server.py
 ```
 
 Then open **http://127.0.0.1:5000** in your phone browser.
@@ -85,23 +80,22 @@ The UI is designed for one-handed use: big tap targets, high contrast.
 
 ## Keep it running in the background
 
-Termux may get killed by Android battery optimization.
-Fix this once:
+Termux may get killed by Android battery optimization. Fix this once:
 
 - **Settings → Apps → Termux → Battery → Unrestricted**
 - Or: Settings → Battery → Background app management → Termux → Don't restrict
 
 Also works via adb:
-```bash
+
+```
 adb shell dumpsys deviceidle whitelist +com.termux
 ```
 
 ---
 
-## Run on your home network (access from other devices)
+## Access from other devices on your network
 
-The server binds to `0.0.0.0:5000` by default, so any device on your
-Wi-Fi can open it:
+The server binds to `0.0.0.0:5000` by default, so any device on your Wi-Fi can open it:
 
 ```
 http://<your-phone-ip>:5000
@@ -114,10 +108,9 @@ Find your phone's IP: Settings → Wi-Fi → tap your network → IP address.
 ## File structure
 
 ```
-ytmusic-phone/
+Phone_Music_Player/
 ├── server.py          main Flask app + playback logic
 ├── setup.py           first-time setup + YTMusic login
-├── start.sh           Termux launcher (wake lock + server)
 ├── requirements.txt   Python deps
 ├── oauth.json         YTMusic credentials (created by setup.py)
 └── templates/
@@ -129,26 +122,23 @@ ytmusic-phone/
 ## Troubleshooting
 
 **Music won't start / buffers a lot**
-- yt-dlp resolves a fresh stream URL each time. If it's slow, your network
-  might be rate-limiting. Try: `pip install -U yt-dlp` to get the latest.
+yt-dlp resolves a fresh stream URL each time. If it's slow, try: `pip install -U yt-dlp`
 
 **"mpv not found"**
-```bash
+```
 pkg install mpv
 ```
 
 **YTMusic auth expired**
-```bash
+```
 python setup.py
-# choose re-authenticate
 ```
 
 **Termux killed when screen off**
 See "Keep it running in the background" above.
 
 **Port 5000 already in use**
-Edit `server.py`, last line: change `port=5000` to `port=5001`.
-Then open `http://127.0.0.1:5001`.
+Edit `server.py`, last line: change `port=5000` to `port=5001`, then open `http://127.0.0.1:5001`.
 
 ---
 
