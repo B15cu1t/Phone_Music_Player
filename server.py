@@ -22,6 +22,10 @@ log = logging.getLogger("biscuit")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# TASTE MEMORY  —  persists across sessions in taste.json
+# ═══════════════════════════════════════════════════════════════════════════
+
 TASTE_FILE = Path("taste.json")
 
 def _load_taste():
@@ -102,6 +106,10 @@ def _clean_artist(artist):
     a = re.sub(r'\s*(ft\.?|feat\.?|&|,).*', '', a, flags=re.I)
     return a.strip()
 
+# ═══════════════════════════════════════════════════════════════════════════
+# COVER / REACTION / JUNK FILTER
+# ═══════════════════════════════════════════════════════════════════════════
+
 JUNK_TITLE_PATTERNS = re.compile(
     r'\b(cover|reaction|reacts?|reacting|review|responds?|responds to|'
     r'ranking|ranked|tier list|compilation|best of|top \d+|hours? of|'
@@ -165,6 +173,10 @@ def filter_tracks(tracks, seed_title="", seed_artist=""):
         out.append(t)
     return out
 
+# ═══════════════════════════════════════════════════════════════════════════
+# GENRE GRAPH  —  "if you like X, you might like Y"
+# ═══════════════════════════════════════════════════════════════════════════
+
 GENRE_GRAPH = {
     # metal/hard rock
     "slipknot":      ["korn", "system of a down", "deftones", "disturbed", "five finger death punch", "lamb of god"],
@@ -214,6 +226,10 @@ def get_related_artists(artist):
             seen.add(a)
             out.append(a)
     return out[:6]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SMART SEARCH
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _ytdlp_search(query, limit=10):
     try:
@@ -284,6 +300,10 @@ def search_tracks(query, limit=10):
     filtered = filter_tracks(raw)
     return filtered[:limit]
 
+# ═══════════════════════════════════════════════════════════════════════════
+# QUEUE BUILDING
+# ═══════════════════════════════════════════════════════════════════════════
+
 def seed_queue_from_track(track, size=35):
     """
     Build a queue starting from a seed track.
@@ -351,6 +371,10 @@ def seed_queue_from_track(track, size=35):
     pool = same_pool[:same_artist_target] + other_pool
     return pool[:size]
 
+# ═══════════════════════════════════════════════════════════════════════════
+# YTMUSIC AUTH
+# ═══════════════════════════════════════════════════════════════════════════
+
 ytm = None
 
 def init_ytmusic():
@@ -381,6 +405,10 @@ def _t(t):
 def _best_thumb(thumbs):
     if not thumbs: return ""
     return max(thumbs, key=lambda t: t.get("width",0), default=thumbs[0]).get("url","")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MPV IPC
+# ═══════════════════════════════════════════════════════════════════════════
 
 def mpv_cmd(cmd):
     global ipc_socket
@@ -424,6 +452,10 @@ def mpv_get_pos():
     except Exception:
         return 0.0
 
+# ═══════════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════════
+
 state = {
     "playing":     False,
     "current":     None,
@@ -444,17 +476,71 @@ is_paused   = False
 play_serial = 0
 play_start_time = 0  # for skip detection
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAYBACK
+# ═══════════════════════════════════════════════════════════════════════════
+
 def resolve_audio_url(video_id):
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Strategy 1: bestaudio, pick best audio-only format from formats list
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "format": "bestaudio/best", "noplaylist": True}) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        for fmt in sorted(info.get("formats",[]), key=lambda f: f.get("abr",0) or 0, reverse=True):
-            if fmt.get("vcodec") == "none" and fmt.get("url"):
-                return fmt["url"]
-        return info.get("url")
+        opts = {
+            "quiet":      False,  # show warnings so we can debug
+            "no_warnings": False,
+            "format":     "bestaudio/best",
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if info:
+            # try audio-only formats first
+            fmts = info.get("formats", [])
+            audio_only = [
+                f for f in fmts
+                if f.get("url") and (
+                    f.get("vcodec") in ("none", None, "") or
+                    f.get("acodec") not in ("none", None, "")
+                ) and f.get("acodec") not in ("none", None, "")
+            ]
+            if audio_only:
+                best = max(audio_only, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+                if best.get("url"):
+                    log.info(f"resolved audio format: {best.get('ext')} {best.get('abr')}kbps")
+                    return best["url"]
+
+            # fallback: just use the top-level url yt-dlp resolved
+            if info.get("url"):
+                log.info(f"resolved top-level url")
+                return info["url"]
+
+            # last resort: pick any format with a url
+            for f in reversed(fmts):
+                if f.get("url"):
+                    log.info(f"resolved fallback format: {f.get('ext')}")
+                    return f["url"]
+
     except Exception as e:
-        log.error(f"resolve {video_id}: {e}")
-        return None
+        log.error(f"resolve strategy 1 failed ({video_id}): {e}")
+
+    # Strategy 2: let yt-dlp pick with worstaudio (sometimes works when best fails)
+    try:
+        opts = {
+            "quiet":      True,
+            "format":     "worstaudio/worst",
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info and info.get("url"):
+            log.info(f"resolved via worstaudio fallback")
+            return info["url"]
+    except Exception as e:
+        log.error(f"resolve strategy 2 failed ({video_id}): {e}")
+
+    log.error(f"all resolve strategies failed for {video_id}")
+    return None
 
 def update_media_session(track=None, playing=True):
     """
@@ -533,10 +619,10 @@ def play_track(track):
     global player_proc, ipc_socket, is_paused, play_serial, play_start_time
 
     with play_lock:
-        # detect quick skip on previous track
+        # detect quick skip on previous track — only if it actually started playing
         if state["current"] and play_start_time:
             elapsed = time.time() - play_start_time
-            if elapsed < 10:
+            if 0 < elapsed < 10 and state["progress"] > 2:
                 threading.Thread(target=record_skip, args=(state["current"],), daemon=True).start()
 
         _kill_player()
@@ -643,6 +729,10 @@ def auto_next():
         with play_lock:
             state["playing"] = False
             state["current"] = None
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FLASK API
+# ═══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/state")
 def api_state():
@@ -914,6 +1004,10 @@ def index():
 @app.route("/static/<path:filename>")
 def static_files(filename):
     return send_from_directory("static", filename)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     init_ytmusic()
