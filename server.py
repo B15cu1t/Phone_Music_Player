@@ -22,7 +22,6 @@ log = logging.getLogger("biscuit")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-
 TASTE_FILE = Path("taste.json")
 
 def _load_taste():
@@ -129,7 +128,6 @@ def is_junk(track):
         return True
     if JUNK_UPLOADER_PATTERNS.search(uploader):
         return True
-    # filter out super long videos (albums, compilations) and super short (<60s)
     if dur > 900 or (dur > 0 and dur < 60):
         return True
     return False
@@ -165,7 +163,7 @@ def filter_tracks(tracks, seed_title="", seed_artist=""):
         if is_same_song(t, seed_title, seed_artist): continue
         out.append(t)
     return out
-
+    
 GENRE_GRAPH = {
     # metal/hard rock
     "slipknot":      ["korn", "system of a down", "deftones", "disturbed", "five finger death punch", "lamb of god"],
@@ -301,14 +299,12 @@ def seed_queue_from_track(track, size=35):
     seen    = {video_id}
     pool    = []
 
-    # ── Step 1: more by same artist ──────────────────────────────────────
     same_artist_results = smart_search(artist, "", limit=12)
     for t in filter_tracks(same_artist_results, title, artist):
         if t["video_id"] not in seen:
             seen.add(t["video_id"])
             pool.append(t)
 
-    # ── Step 2: genre-related artists ───────────────────────────────────
     related = get_related_artists(artist)
     random.shuffle(related)
     for rel_artist in related[:4]:
@@ -320,7 +316,6 @@ def seed_queue_from_track(track, size=35):
                 seen.add(t["video_id"])
                 pool.append(t)
 
-    # ── Step 3: taste memory — your top artists ──────────────────────────
     top = [a for a in top_artists(8) if a.lower() not in artist.lower()]
     random.shuffle(top)
     for ta in top[:3]:
@@ -331,8 +326,6 @@ def seed_queue_from_track(track, size=35):
             if t["video_id"] not in seen:
                 seen.add(t["video_id"])
                 pool.append(t)
-
-    # ── Step 4: if still thin, search for the genre vibe ────────────────
     if len(pool) < 10:
         genre_query = f"{artist} genre similar bands official audio"
         results = _ytdlp_search(genre_query, 10)
@@ -620,6 +613,7 @@ def api_play():
                 threading.Thread(target=play_track, args=(t,), daemon=True).start()
                 threading.Thread(target=_rebuild_around, args=(track,), daemon=True).start()
                 return jsonify({"ok": True})
+        # new track — play immediately, build queue around it
         state["queue"]       = [track]
         state["queue_index"] = 0
         threading.Thread(target=play_track, args=(track,), daemon=True).start()
@@ -689,8 +683,10 @@ def api_dislike():
     vid = (request.json or {}).get("video_id")
     if vid:
         blacklist_track(vid)
+        # if it's current, skip it
         if state["current"] and state["current"]["video_id"] == vid:
             threading.Thread(target=auto_next, daemon=True).start()
+        # remove from queue
         state["queue"] = [t for t in state["queue"] if t["video_id"] != vid]
     return jsonify({"ok": True})
 
@@ -733,6 +729,45 @@ def api_remove():
             elif i == idx:
                 state["queue_index"] = min(idx, len(q) - 1)
             break
+    return jsonify({"ok": True})
+
+@app.route("/api/queue/reorder", methods=["POST"])
+def api_reorder():
+    """
+    Move a track from one position to another.
+    Expects: { from_id: video_id, to_id: video_id }
+    Inserts the dragged track before the target track.
+    """
+    data    = request.json or {}
+    from_id = data.get("from_id")
+    to_id   = data.get("to_id")
+    if not from_id or not to_id or from_id == to_id:
+        return jsonify({"ok": False})
+
+    q   = state["queue"]
+    idx = state["queue_index"]
+
+    # find positions
+    from_pos = next((i for i, t in enumerate(q) if t["video_id"] == from_id), None)
+    to_pos   = next((i for i, t in enumerate(q) if t["video_id"] == to_id), None)
+    if from_pos is None or to_pos is None:
+        return jsonify({"ok": False, "error": "track not found"})
+
+    # pull out the moving track
+    track = q.pop(from_pos)
+    # recalculate to_pos after removal
+    if from_pos < to_pos:
+        to_pos -= 1
+    q.insert(to_pos, track)
+
+    # fix queue_index to keep pointing at the same track
+    cur_id = state["current"]["video_id"] if state["current"] else None
+    if cur_id:
+        for i, t in enumerate(q):
+            if t["video_id"] == cur_id:
+                state["queue_index"] = i
+                break
+
     return jsonify({"ok": True})
 
 @app.route("/api/queue/seed", methods=["POST"])
