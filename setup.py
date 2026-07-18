@@ -52,7 +52,7 @@ def main():
         else:
             print("  termux-api missing — installing...")
             try:
-                subprocess.check_call(["pkg", "install", "termux-api", "-y"])
+                subprocess.check_call(["pkg", "install", "termux-api", "curl", "-y"])
                 print("  termux-api ok")
                 print("  ! also install the Termux:API app from F-Droid for lockscreen support")
                 print("    https://f-droid.org/packages/com.termux.api/")
