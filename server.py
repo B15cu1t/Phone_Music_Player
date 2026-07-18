@@ -299,6 +299,7 @@ def seed_queue_from_track(track, size=35):
     same_pool  = []   # songs by same artist
     other_pool = []   # related / taste artists
 
+    # ── Step 1: fill with same-artist songs (aim for ~70% of size) ───────
     # Use multiple query angles to get variety within the same artist
     same_artist_target = max(int(size * 0.70), 10)
     queries = [
@@ -320,6 +321,7 @@ def seed_queue_from_track(track, size=35):
     # shuffle the same-artist pool so it doesn't repeat the same order
     random.shuffle(same_pool)
 
+    # ── Step 2: a few related artists (~20%) ────────────────────────────
     related_target = max(int(size * 0.20), 4)
     related = get_related_artists(artist)
     random.shuffle(related)
@@ -332,6 +334,7 @@ def seed_queue_from_track(track, size=35):
                 seen.add(t["video_id"])
                 other_pool.append(t)
 
+    # ── Step 3: taste memory sprinkle (~10%) ────────────────────────────
     taste_target = max(int(size * 0.10), 2)
     top = [a for a in top_artists(8) if _clean_artist(a).lower() not in artist.lower()]
     random.shuffle(top)
@@ -344,6 +347,7 @@ def seed_queue_from_track(track, size=35):
                 seen.add(t["video_id"])
                 other_pool.append(t)
 
+    # ── Combine: same artist first, others at the end ───────────────────
     pool = same_pool[:same_artist_target] + other_pool
     return pool[:size]
 
@@ -454,36 +458,58 @@ def resolve_audio_url(video_id):
 
 def update_media_session(track=None, playing=True):
     """
-    Update the Android media notification via termux-media-session.
-    Shows title/artist on lockscreen with pause + next buttons.
-    Silently does nothing if termux-media-session isn't available.
+    Show an Android media notification with lockscreen controls.
+    Uses termux-notification --type media (correct API).
+    Button actions call curl to hit our local Flask server.
     """
     try:
-        if track:
-            title  = track.get("title", "Biscuit")
-            artist = track.get("artist", "")
-            # set metadata + playback state
-            cmd = [
-                "termux-media-session",
-                "--title",  title,
-                "--artist", artist,
-                "--album",  "Biscuit Music Player",
-            ]
-            if playing:
-                cmd += ["--is-playing", "true"]
-            else:
-                cmd += ["--is-playing", "false"]
+        if not track:
+            # remove the notification
+            subprocess.Popen(
+                ["termux-notification-remove", "--id", "88"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return
+
+        title  = track.get("title", "Biscuit")
+        artist = track.get("artist", "")
+        content = artist if artist else "Biscuit Music Player"
+
+        # These shell commands are called when notification buttons are tapped.
+        # They hit our Flask API directly.
+        pause_cmd = "curl -s -X POST http://127.0.0.1:5000/api/pause"
+        play_cmd  = "curl -s -X POST http://127.0.0.1:5000/api/resume"
+        next_cmd  = "curl -s -X POST http://127.0.0.1:5000/api/next"
+        prev_cmd  = "curl -s -X POST http://127.0.0.1:5000/api/prev"
+
+        cmd = [
+            "termux-notification",
+            "--id",       "88",
+            "--title",    title,
+            "--content",  content,
+            "--type",     "media",
+            "--priority", "high",
+            "--alert-once",
+            "--ongoing",
+            "--media-previous", prev_cmd,
+            "--media-next",     next_cmd,
+        ]
+
+        # show pause or play button depending on state
+        if playing:
+            cmd += ["--media-pause", pause_cmd]
         else:
-            # clear the notification
-            cmd = ["termux-media-session", "--is-playing", "false"]
+            cmd += ["--media-play", play_cmd]
 
         subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+        log.info(f"media notification: {title} ({'playing' if playing else 'paused'})")
+
     except FileNotFoundError:
-        pass  # termux-media-session not installed, no-op
+        pass  # termux-notification not installed, no-op
     except Exception as e:
         log.debug(f"media session: {e}")
 
