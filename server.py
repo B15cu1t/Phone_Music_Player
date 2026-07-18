@@ -128,6 +128,7 @@ def is_junk(track):
         return True
     if JUNK_UPLOADER_PATTERNS.search(uploader):
         return True
+    # filter out super long videos (albums, compilations) and super short (<60s)
     if dur > 900 or (dur > 0 and dur < 60):
         return True
     return False
@@ -163,7 +164,7 @@ def filter_tracks(tracks, seed_title="", seed_artist=""):
         if is_same_song(t, seed_title, seed_artist): continue
         out.append(t)
     return out
-    
+
 GENRE_GRAPH = {
     # metal/hard rock
     "slipknot":      ["korn", "system of a down", "deftones", "disturbed", "five finger death punch", "lamb of god"],
@@ -285,57 +286,65 @@ def search_tracks(query, limit=10):
 
 def seed_queue_from_track(track, size=35):
     """
-    Build a diverse queue starting from a seed track.
-    Strategy:
-      1. More songs by the same artist (but NOT the same song, no covers)
-      2. Songs by genre-related artists
-      3. Top artists from taste memory (what you've been listening to)
-    All filtered for junk and deduplication.
+    Build a queue starting from a seed track.
+    Ratio: ~70% same artist, ~20% related artists, ~10% taste memory.
+    Same artist always comes first and dominates — if you search Korn
+    you get mostly Korn, with a few related tracks sprinkled at the end.
     """
-    artist     = track.get("artist", "")
-    title      = track.get("title", "")
-    video_id   = track.get("video_id", "")
+    artist   = track.get("artist", "")
+    title    = track.get("title", "")
+    video_id = track.get("video_id", "")
 
-    seen    = {video_id}
-    pool    = []
+    seen       = {video_id}
+    same_pool  = []   # songs by same artist
+    other_pool = []   # related / taste artists
 
-    same_artist_results = smart_search(artist, "", limit=12)
-    for t in filter_tracks(same_artist_results, title, artist):
-        if t["video_id"] not in seen:
-            seen.add(t["video_id"])
-            pool.append(t)
-
-    related = get_related_artists(artist)
-    random.shuffle(related)
-    for rel_artist in related[:4]:
-        if len(pool) >= size:
+    # Use multiple query angles to get variety within the same artist
+    same_artist_target = max(int(size * 0.70), 10)
+    queries = [
+        f"{artist} official audio",
+        f"{artist} songs",
+        f"{artist} greatest hits",
+        f"{artist} best songs",
+        f"{artist} full song",
+    ]
+    for q in queries:
+        if len(same_pool) >= same_artist_target:
             break
-        results = smart_search(rel_artist, limit=6)
-        for t in filter_tracks(results):
-            if t["video_id"] not in seen:
-                seen.add(t["video_id"])
-                pool.append(t)
-
-    top = [a for a in top_artists(8) if a.lower() not in artist.lower()]
-    random.shuffle(top)
-    for ta in top[:3]:
-        if len(pool) >= size:
-            break
-        results = smart_search(ta, limit=5)
-        for t in filter_tracks(results):
-            if t["video_id"] not in seen:
-                seen.add(t["video_id"])
-                pool.append(t)
-    if len(pool) < 10:
-        genre_query = f"{artist} genre similar bands official audio"
-        results = _ytdlp_search(genre_query, 10)
+        results = _ytdlp_search(q, 12)
         for t in filter_tracks(results, title, artist):
             if t["video_id"] not in seen:
                 seen.add(t["video_id"])
-                pool.append(t)
+                same_pool.append(t)
 
-    # shuffle but keep it feeling varied (interleave sources)
-    random.shuffle(pool)
+    # shuffle the same-artist pool so it doesn't repeat the same order
+    random.shuffle(same_pool)
+
+    related_target = max(int(size * 0.20), 4)
+    related = get_related_artists(artist)
+    random.shuffle(related)
+    for rel_artist in related[:3]:
+        if len(other_pool) >= related_target:
+            break
+        results = smart_search(rel_artist, limit=5)
+        for t in filter_tracks(results):
+            if t["video_id"] not in seen:
+                seen.add(t["video_id"])
+                other_pool.append(t)
+
+    taste_target = max(int(size * 0.10), 2)
+    top = [a for a in top_artists(8) if _clean_artist(a).lower() not in artist.lower()]
+    random.shuffle(top)
+    for ta in top[:2]:
+        if len(other_pool) >= related_target + taste_target:
+            break
+        results = smart_search(ta, limit=4)
+        for t in filter_tracks(results):
+            if t["video_id"] not in seen:
+                seen.add(t["video_id"])
+                other_pool.append(t)
+
+    pool = same_pool[:same_artist_target] + other_pool
     return pool[:size]
 
 ytm = None
@@ -443,6 +452,41 @@ def resolve_audio_url(video_id):
         log.error(f"resolve {video_id}: {e}")
         return None
 
+def update_media_session(track=None, playing=True):
+    """
+    Update the Android media notification via termux-media-session.
+    Shows title/artist on lockscreen with pause + next buttons.
+    Silently does nothing if termux-media-session isn't available.
+    """
+    try:
+        if track:
+            title  = track.get("title", "Biscuit")
+            artist = track.get("artist", "")
+            # set metadata + playback state
+            cmd = [
+                "termux-media-session",
+                "--title",  title,
+                "--artist", artist,
+                "--album",  "Biscuit Music Player",
+            ]
+            if playing:
+                cmd += ["--is-playing", "true"]
+            else:
+                cmd += ["--is-playing", "false"]
+        else:
+            # clear the notification
+            cmd = ["termux-media-session", "--is-playing", "false"]
+
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        pass  # termux-media-session not installed, no-op
+    except Exception as e:
+        log.debug(f"media session: {e}")
+
 def _kill_player():
     global player_proc, ipc_socket, is_paused
     if player_proc:
@@ -506,6 +550,8 @@ def play_track(track):
         state["playing"] = True
         play_start_time  = time.time()
 
+    # update Android lockscreen notification
+    threading.Thread(target=update_media_session, args=(track, True), daemon=True).start()
     threading.Thread(target=_watcher, args=(my_serial,), daemon=True).start()
     threading.Thread(target=_progress_tracker, args=(my_serial,), daemon=True).start()
     # record play after 30s in background
@@ -645,6 +691,7 @@ def api_pause():
         if ok:
             is_paused        = True
             state["playing"] = False
+    threading.Thread(target=update_media_session, args=(state["current"], False), daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/api/resume", methods=["POST"])
@@ -661,6 +708,8 @@ def api_resume():
     idx = state["queue_index"]
     if idx < len(q):
         threading.Thread(target=play_track, args=(q[idx],), daemon=True).start()
+    else:
+        threading.Thread(target=update_media_session, args=(state["current"], True), daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/api/next", methods=["POST"])
@@ -790,6 +839,23 @@ def api_seed_queue():
         # rebuild properly around first result
         threading.Thread(target=_rebuild_around, args=(filtered[0],), daemon=True).start()
     threading.Thread(target=_seed, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/api/media-button", methods=["POST"])
+def api_media_button():
+    """
+    Called by termux-media-session when user taps buttons on the notification.
+    Action: 'play', 'pause', 'next', 'previous'
+    """
+    action = (request.json or {}).get("action","")
+    if action == "next":
+        threading.Thread(target=auto_next, daemon=True).start()
+    elif action in ("pause","play_pause") and state["playing"]:
+        api_pause()
+    elif action in ("play","play_pause") and not state["playing"]:
+        api_resume()
+    elif action == "previous":
+        api_prev()
     return jsonify({"ok": True})
 
 @app.route("/api/taste")
