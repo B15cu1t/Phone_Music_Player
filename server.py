@@ -22,10 +22,6 @@ log = logging.getLogger("biscuit")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TASTE MEMORY  —  persists across sessions in taste.json
-# ═══════════════════════════════════════════════════════════════════════════
-
 TASTE_FILE = Path("taste.json")
 
 def _load_taste():
@@ -106,10 +102,6 @@ def _clean_artist(artist):
     a = re.sub(r'\s*(ft\.?|feat\.?|&|,).*', '', a, flags=re.I)
     return a.strip()
 
-# ═══════════════════════════════════════════════════════════════════════════
-# COVER / REACTION / JUNK FILTER
-# ═══════════════════════════════════════════════════════════════════════════
-
 JUNK_TITLE_PATTERNS = re.compile(
     r'\b(cover|reaction|reacts?|reacting|review|responds?|responds to|'
     r'ranking|ranked|tier list|compilation|best of|top \d+|hours? of|'
@@ -173,10 +165,6 @@ def filter_tracks(tracks, seed_title="", seed_artist=""):
         out.append(t)
     return out
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GENRE GRAPH  —  "if you like X, you might like Y"
-# ═══════════════════════════════════════════════════════════════════════════
-
 GENRE_GRAPH = {
     # metal/hard rock
     "slipknot":      ["korn", "system of a down", "deftones", "disturbed", "five finger death punch", "lamb of god"],
@@ -227,17 +215,9 @@ def get_related_artists(artist):
             out.append(a)
     return out[:6]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SMART SEARCH
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _ytdlp_search(query, limit=10):
     try:
-        opts = {
-            "quiet": True,
-            "extract_flat": True,
-            "default_search": "ytsearch",
-        }
+        opts = _ydl_opts({"extract_flat": True})
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
         results = []
@@ -300,10 +280,6 @@ def search_tracks(query, limit=10):
     filtered = filter_tracks(raw)
     return filtered[:limit]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# QUEUE BUILDING
-# ═══════════════════════════════════════════════════════════════════════════
-
 def seed_queue_from_track(track, size=35):
     """
     Build a queue starting from a seed track.
@@ -319,7 +295,6 @@ def seed_queue_from_track(track, size=35):
     same_pool  = []   # songs by same artist
     other_pool = []   # related / taste artists
 
-    # ── Step 1: fill with same-artist songs (aim for ~70% of size) ───────
     # Use multiple query angles to get variety within the same artist
     same_artist_target = max(int(size * 0.70), 10)
     queries = [
@@ -341,7 +316,6 @@ def seed_queue_from_track(track, size=35):
     # shuffle the same-artist pool so it doesn't repeat the same order
     random.shuffle(same_pool)
 
-    # ── Step 2: a few related artists (~20%) ────────────────────────────
     related_target = max(int(size * 0.20), 4)
     related = get_related_artists(artist)
     random.shuffle(related)
@@ -354,7 +328,6 @@ def seed_queue_from_track(track, size=35):
                 seen.add(t["video_id"])
                 other_pool.append(t)
 
-    # ── Step 3: taste memory sprinkle (~10%) ────────────────────────────
     taste_target = max(int(size * 0.10), 2)
     top = [a for a in top_artists(8) if _clean_artist(a).lower() not in artist.lower()]
     random.shuffle(top)
@@ -367,13 +340,8 @@ def seed_queue_from_track(track, size=35):
                 seen.add(t["video_id"])
                 other_pool.append(t)
 
-    # ── Combine: same artist first, others at the end ───────────────────
     pool = same_pool[:same_artist_target] + other_pool
     return pool[:size]
-
-# ═══════════════════════════════════════════════════════════════════════════
-# YTMUSIC AUTH
-# ═══════════════════════════════════════════════════════════════════════════
 
 ytm = None
 
@@ -405,10 +373,6 @@ def _t(t):
 def _best_thumb(thumbs):
     if not thumbs: return ""
     return max(thumbs, key=lambda t: t.get("width",0), default=thumbs[0]).get("url","")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MPV IPC
-# ═══════════════════════════════════════════════════════════════════════════
 
 def mpv_cmd(cmd):
     global ipc_socket
@@ -452,10 +416,6 @@ def mpv_get_pos():
     except Exception:
         return 0.0
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STATE
-# ═══════════════════════════════════════════════════════════════════════════
-
 state = {
     "playing":     False,
     "current":     None,
@@ -476,26 +436,36 @@ is_paused   = False
 play_serial = 0
 play_start_time = 0  # for skip detection
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PLAYBACK
-# ═══════════════════════════════════════════════════════════════════════════
+COOKIES_FILE = Path("youtube.com_cookies.txt")
+
+def _ydl_opts(extra=None):
+    """Base yt-dlp options, automatically uses cookies if available."""
+    opts = {
+        "quiet":      True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+    if COOKIES_FILE.exists():
+        opts["cookiefile"] = str(COOKIES_FILE)
+        log.debug("using cookies file")
+    if extra:
+        opts.update(extra)
+    return opts
 
 def resolve_audio_url(video_id):
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     # Strategy 1: bestaudio, pick best audio-only format from formats list
     try:
-        opts = {
-            "quiet":      False,  # show warnings so we can debug
+        opts = _ydl_opts({
+            "quiet":       False,
             "no_warnings": False,
-            "format":     "bestaudio/best",
-            "noplaylist": True,
-        }
+            "format":      "bestaudio/best",
+        })
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         if info:
-            # try audio-only formats first
             fmts = info.get("formats", [])
             audio_only = [
                 f for f in fmts
@@ -510,12 +480,10 @@ def resolve_audio_url(video_id):
                     log.info(f"resolved audio format: {best.get('ext')} {best.get('abr')}kbps")
                     return best["url"]
 
-            # fallback: just use the top-level url yt-dlp resolved
             if info.get("url"):
-                log.info(f"resolved top-level url")
+                log.info("resolved top-level url")
                 return info["url"]
 
-            # last resort: pick any format with a url
             for f in reversed(fmts):
                 if f.get("url"):
                     log.info(f"resolved fallback format: {f.get('ext')}")
@@ -524,17 +492,13 @@ def resolve_audio_url(video_id):
     except Exception as e:
         log.error(f"resolve strategy 1 failed ({video_id}): {e}")
 
-    # Strategy 2: let yt-dlp pick with worstaudio (sometimes works when best fails)
+    # Strategy 2: worstaudio fallback
     try:
-        opts = {
-            "quiet":      True,
-            "format":     "worstaudio/worst",
-            "noplaylist": True,
-        }
+        opts = _ydl_opts({"format": "worstaudio/worst"})
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if info and info.get("url"):
-            log.info(f"resolved via worstaudio fallback")
+            log.info("resolved via worstaudio fallback")
             return info["url"]
     except Exception as e:
         log.error(f"resolve strategy 2 failed ({video_id}): {e}")
@@ -729,10 +693,6 @@ def auto_next():
         with play_lock:
             state["playing"] = False
             state["current"] = None
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FLASK API
-# ═══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/state")
 def api_state():
@@ -1004,10 +964,6 @@ def index():
 @app.route("/static/<path:filename>")
 def static_files(filename):
     return send_from_directory("static", filename)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     init_ytmusic()
