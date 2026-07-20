@@ -54,12 +54,29 @@ def main():
         print("  platform: Android (Termux)")
     elif is_ish():
         print("  platform: iPhone (iSH)")
+        # make sure python3 and basic tools are present on Alpine
+        try:
+            subprocess.check_call(["apk", "add", "--no-cache",
+                                   "python3", "py3-pip", "curl", "mpv"])
+            print("  ✓ base packages (python3, pip, curl, mpv)")
+        except Exception as e:
+            print(f"  ! apk install warning: {e}")
     else:
         print("  platform: Linux/Mac")
 
     print()
 
     # 1. Python deps
+    # iSH/Alpine doesn't have pip by default — install it first
+    if is_ish() and not shutil.which("pip3") and not shutil.which("pip"):
+        print("  installing pip...")
+        try:
+            subprocess.check_call(["apk", "add", "--no-cache", "py3-pip"])
+        except Exception as e:
+            print(f"  ✗ pip install failed: {e}")
+            print("  try manually: apk add py3-pip")
+            sys.exit(1)
+
     missing = []
     for pkg in REQUIRED:
         try:
@@ -68,7 +85,12 @@ def main():
             missing.append(pkg)
     if missing:
         print(f"  installing python deps: {', '.join(missing)}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+        # iSH needs --break-system-packages on newer pip
+        pip_args = [sys.executable, "-m", "pip", "install"]
+        if is_ish():
+            pip_args += ["--break-system-packages"]
+        pip_args += missing
+        subprocess.check_call(pip_args)
     print("  ✓ python deps")
 
     # 2. mpv
