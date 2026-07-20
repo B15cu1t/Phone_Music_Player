@@ -85,12 +85,7 @@ def main():
             missing.append(pkg)
     if missing:
         print(f"  installing python deps: {', '.join(missing)}...")
-        # iSH needs --break-system-packages on newer pip
-        pip_args = [sys.executable, "-m", "pip", "install"]
-        if is_ish():
-            pip_args += ["--break-system-packages"]
-        pip_args += missing
-        subprocess.check_call(pip_args)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
     print("  ✓ python deps")
 
     # 2. mpv
