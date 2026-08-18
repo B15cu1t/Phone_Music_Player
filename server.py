@@ -129,6 +129,7 @@ def is_junk(track):
         return True
     if JUNK_UPLOADER_PATTERNS.search(uploader):
         return True
+    # filter out super long videos (albums, compilations) and super short (<60s)
     if dur > 900 or (dur > 0 and dur < 60):
         return True
     return False
@@ -206,6 +207,7 @@ def get_related_artists(artist):
                 related.append(key)
                 related.extend(vals)
                 break
+    # deduplicate, exclude self
     seen = set()
     out = []
     for a in related:
@@ -291,9 +293,10 @@ def seed_queue_from_track(track, size=35):
     video_id = track.get("video_id", "")
 
     seen       = {video_id}
-    same_pool  = []
-    other_pool = []
+    same_pool  = []   # songs by same artist
+    other_pool = []   # related / taste artists
 
+    # Use multiple query angles to get variety within the same artist
     same_artist_target = max(int(size * 0.70), 10)
     queries = [
         f"{artist} official audio",
@@ -311,6 +314,7 @@ def seed_queue_from_track(track, size=35):
                 seen.add(t["video_id"])
                 same_pool.append(t)
 
+    # shuffle the same-artist pool so it doesn't repeat the same order
     random.shuffle(same_pool)
 
     related_target = max(int(size * 0.20), 4)
@@ -431,11 +435,15 @@ player_proc = None
 ipc_socket  = None
 is_paused   = False
 play_serial = 0
-play_start_time = 0 
+play_start_time = 0  # for skip detection
 
+# --- failure-loop breaker -------------------------------------------------
+# If mpv keeps dying instantly on consecutive tracks (bad URLs, broken
+# extractor, no network, etc), don't silently chew through the whole
+# queue in a few seconds — stop and surface a real error instead.
 consecutive_failures = 0
 MAX_CONSECUTIVE_FAILURES = 4
-MIN_HEALTHY_PLAYBACK_SECONDS = 4
+MIN_HEALTHY_PLAYBACK_SECONDS = 4  # below this + nonzero exit = treated as a failure
 
 COOKIES_FILE = Path("youtube.com_cookies.txt")
 
@@ -453,71 +461,31 @@ def _ydl_opts(extra=None):
         opts.update(extra)
     return opts
 
-def resolve_audio_url(video_id):
+def _mpv_ytdl_args(video_id):
     """
-    Resolve a playable direct audio URL for a video ID.
+    Build the mpv args needed to let mpv's own yt-dlp integration
+    (ytdl_hook) play a YouTube video directly.
 
-    IMPORTANT: this trusts yt-dlp's own format selection (via the `format`
-    option) instead of re-picking a format manually. Manually re-picking
-    formats from the raw `formats` list was the root cause of picking
-    broken/throttled formats (showing up as bitrate "None" in the logs),
-    which mpv would open and immediately exit from with no audio.
+    IMPORTANT: earlier versions of this app pre-resolved a raw stream URL
+    in Python (via yt_dlp.extract_info) and handed that bare URL to mpv.
+    That raw URL is frequently a fragmented/DASH stream that isn't
+    playable standalone — mpv would open it and die almost immediately
+    (logs showed "resolved top-level url" followed by mpv exiting with
+    code=2 after ~2s on every track). Instead, we hand mpv the actual
+    youtube.com watch URL and let ytdl_hook + yt-dlp pick a properly
+    playable single-file format themselves — this is the same path that
+    worked in manual testing once ytdl_hook was pointed at system yt-dlp
+    instead of mpv's bundled (often outdated) youtube-dl.
     """
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    try:
-        opts = _ydl_opts({
-            "quiet":       True,
-            "no_warnings": True,
-            "format":      "bestaudio[ext=m4a]/bestaudio/best",
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if info:
-            downloads = info.get("requested_downloads") or []
-            if downloads and downloads[0].get("url"):
-                fmt = downloads[0]
-                log.info(f"resolved audio format: {fmt.get('ext')} {fmt.get('abr') or fmt.get('tbr')}kbps")
-                return fmt["url"]
-
-            if info.get("url"):
-                log.info("resolved top-level url")
-                return info["url"]
-
-            fmts = info.get("formats", [])
-            audio_only = [
-                f for f in fmts
-                if f.get("url")
-                and f.get("acodec") not in (None, "none")
-                and f.get("vcodec") in (None, "none")
-                and (f.get("abr") or f.get("tbr"))
-            ]
-            if audio_only:
-                best = max(audio_only, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-                log.info(f"resolved fallback format: {best.get('ext')} {best.get('abr') or best.get('tbr')}kbps")
-                return best["url"]
-
-    except Exception as e:
-        log.error(f"resolve strategy 1 failed ({video_id}): {e}")
-
-    try:
-        opts = _ydl_opts({"format": "worstaudio/worst"})
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if info:
-            downloads = info.get("requested_downloads") or []
-            if downloads and downloads[0].get("url"):
-                log.info("resolved via worstaudio fallback")
-                return downloads[0]["url"]
-            if info.get("url"):
-                log.info("resolved via worstaudio fallback (top-level url)")
-                return info["url"]
-    except Exception as e:
-        log.error(f"resolve strategy 2 failed ({video_id}): {e}")
-
-    log.error(f"all resolve strategies failed for {video_id}")
-    return None
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    args = [
+        "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+        "--ytdl-format=bestaudio/best",
+    ]
+    if COOKIES_FILE.exists():
+        args.append(f"--ytdl-raw-options=cookies={COOKIES_FILE}")
+    args.append(watch_url)
+    return args
 
 def update_media_session(track=None, playing=True):
     """
@@ -527,6 +495,7 @@ def update_media_session(track=None, playing=True):
     """
     try:
         if not track:
+            # remove the notification
             subprocess.Popen(
                 ["termux-notification-remove", "--id", "88"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -537,6 +506,8 @@ def update_media_session(track=None, playing=True):
         artist = track.get("artist", "")
         content = artist if artist else "Biscuit Music Player"
 
+        # These shell commands are called when notification buttons are tapped.
+        # They hit our Flask API directly.
         pause_cmd = "curl -s -X POST http://127.0.0.1:5000/api/pause"
         play_cmd  = "curl -s -X POST http://127.0.0.1:5000/api/resume"
         next_cmd  = "curl -s -X POST http://127.0.0.1:5000/api/next"
@@ -555,6 +526,7 @@ def update_media_session(track=None, playing=True):
             "--media-next",     next_cmd,
         ]
 
+        # show pause or play button depending on state
         if playing:
             cmd += ["--media-pause", pause_cmd]
         else:
@@ -568,7 +540,7 @@ def update_media_session(track=None, playing=True):
         log.info(f"media notification: {title} ({'playing' if playing else 'paused'})")
 
     except FileNotFoundError:
-        pass
+        pass  # termux-notification not installed, no-op
     except Exception as e:
         log.debug(f"media session: {e}")
 
@@ -592,6 +564,7 @@ def play_track(track):
     global player_proc, ipc_socket, is_paused, play_serial, play_start_time
 
     with play_lock:
+        # detect quick skip on previous track — only if it actually started playing
         if state["current"] and play_start_time:
             elapsed = time.time() - play_start_time
             if 0 < elapsed < 10 and state["progress"] > 2:
@@ -608,20 +581,13 @@ def play_track(track):
         is_paused = False
         play_start_time = 0
 
-    log.info(f"▶ resolving: {track['title']} — {track['artist']}")
-    url = resolve_audio_url(track["video_id"])
+    log.info(f"▶ playing: {track['title']} — {track['artist']}")
 
     with play_lock:
         if play_serial != my_serial:
             log.info("superseded")
             return
         state["loading"] = False
-        if not url:
-            state["error"]   = "Could not load audio"
-            state["playing"] = False
-            _register_failure()
-            threading.Thread(target=auto_next, daemon=True).start()
-            return
 
         sock_path  = str(Path(tempfile.gettempdir()) / f"biscuit_{my_serial}.sock")
         ipc_socket = sock_path
@@ -629,9 +595,7 @@ def play_track(track):
             "mpv", "--no-video",
             f"--volume={state['volume']}",
             f"--input-ipc-server={sock_path}",
-            "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
-            url,
-        ]
+        ] + _mpv_ytdl_args(track["video_id"])
         player_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -641,9 +605,11 @@ def play_track(track):
         state["playing"] = True
         play_start_time  = time.time()
 
+    # update Android lockscreen notification
     threading.Thread(target=update_media_session, args=(track, True), daemon=True).start()
     threading.Thread(target=_watcher, args=(my_serial,), daemon=True).start()
     threading.Thread(target=_progress_tracker, args=(my_serial,), daemon=True).start()
+    # record play after 30s in background
     threading.Thread(target=_delayed_record, args=(my_serial, track), daemon=True).start()
 
 def _delayed_record(serial, track):
@@ -674,6 +640,8 @@ def _watcher(serial):
     if not proc:
         return
 
+    # Use communicate() (not wait()) since stderr is now a PIPE — wait()
+    # alone can deadlock once the OS pipe buffer fills up.
     try:
         _, stderr_output = proc.communicate()
     except Exception:
@@ -691,6 +659,8 @@ def _watcher(serial):
     returncode = proc.returncode
 
     if returncode != 0 or elapsed < MIN_HEALTHY_PLAYBACK_SECONDS:
+        # Real failure: nonzero exit, or exited suspiciously fast (silent
+        # failure pattern — mpv opened the URL and died with no audio).
         tail = (stderr_output or "").strip()[-500:]
         log.error(
             f"mpv exited abnormally (code={returncode}, after {elapsed:.1f}s): {tail}"
@@ -734,6 +704,7 @@ def auto_next():
 
     next_idx = idx + 1
 
+    # near end — refill with more smart songs
     if next_idx >= len(q) - 5:
         cur = state["current"]
         if cur:
@@ -760,7 +731,7 @@ def api_state():
         "paused":     is_paused,
         "loading":    state["loading"],
         "current":    state["current"],
-        "queue":      q[idx+1:idx+21],
+        "queue":      q[idx+1:idx+21],  # next 20, not including current
         "volume":     state["volume"],
         "progress":   state["progress"],
         "shuffle":    state["shuffle"],
@@ -786,6 +757,7 @@ def api_play():
             "thumbnail": data.get("thumbnail",""),
             "duration":  data.get("duration", 0),
         }
+        # check if already in queue
         q = state["queue"]
         for i, t in enumerate(q):
             if t["video_id"] == vid:
@@ -793,6 +765,7 @@ def api_play():
                 threading.Thread(target=play_track, args=(t,), daemon=True).start()
                 threading.Thread(target=_rebuild_around, args=(track,), daemon=True).start()
                 return jsonify({"ok": True})
+        # new track — play immediately, build queue around it
         state["queue"]       = [track]
         state["queue_index"] = 0
         threading.Thread(target=play_track, args=(track,), daemon=True).start()
@@ -848,7 +821,7 @@ def api_resume():
 @app.route("/api/next", methods=["POST"])
 def api_next():
     global consecutive_failures
-    consecutive_failures = 0
+    consecutive_failures = 0  # user-initiated skip resets the failure breaker
     threading.Thread(target=auto_next, daemon=True).start()
     return jsonify({"ok": True})
 
@@ -867,8 +840,10 @@ def api_dislike():
     vid = (request.json or {}).get("video_id")
     if vid:
         blacklist_track(vid)
+        # if it's current, skip it
         if state["current"] and state["current"]["video_id"] == vid:
             threading.Thread(target=auto_next, daemon=True).start()
+        # remove from queue
         state["queue"] = [t for t in state["queue"] if t["video_id"] != vid]
     return jsonify({"ok": True})
 
@@ -929,16 +904,20 @@ def api_reorder():
     q   = state["queue"]
     idx = state["queue_index"]
 
+    # find positions
     from_pos = next((i for i, t in enumerate(q) if t["video_id"] == from_id), None)
     to_pos   = next((i for i, t in enumerate(q) if t["video_id"] == to_id), None)
     if from_pos is None or to_pos is None:
         return jsonify({"ok": False, "error": "track not found"})
 
+    # pull out the moving track
     track = q.pop(from_pos)
+    # recalculate to_pos after removal
     if from_pos < to_pos:
         to_pos -= 1
     q.insert(to_pos, track)
 
+    # fix queue_index to keep pointing at the same track
     cur_id = state["current"]["video_id"] if state["current"] else None
     if cur_id:
         for i, t in enumerate(q):
@@ -965,6 +944,7 @@ def api_seed_queue():
         state["queue_index"] = 0
         state["error"]       = None
         play_track(filtered[0])
+        # rebuild properly around first result
         threading.Thread(target=_rebuild_around, args=(filtered[0],), daemon=True).start()
     threading.Thread(target=_seed, daemon=True).start()
     return jsonify({"ok": True})
@@ -1035,6 +1015,8 @@ def _update_ytdlp():
         if result.returncode == 0:
             log.info("yt-dlp is up to date")
         else:
+            # --break-system-packages isn't valid everywhere (e.g. some
+            # non-Debian/Termux environments) — retry without it.
             result2 = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "-U", "yt-dlp", "-q"],
                 capture_output=True, text=True, timeout=60
@@ -1049,5 +1031,5 @@ def _update_ytdlp():
 if __name__ == "__main__":
     _update_ytdlp()
     init_ytmusic()
-    log.info("Biscuit ready → http://0.0.0.0:5000")
+    log.info("🍪 Biscuit ready → http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
