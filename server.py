@@ -5,7 +5,7 @@ Overhauled: taste memory, smart diverse queuing, blacklist, cover/reaction filte
 Patched: robust audio resolution, real failure detection, self-updating yt-dlp.
 """
 
-import os, sys, json, re, random, threading, subprocess, time, logging, socket, tempfile
+import os, sys, json, re, random, threading, subprocess, time, logging, socket, tempfile, shutil
 from pathlib import Path
 from collections import defaultdict
 from flask import Flask, jsonify, request, send_from_directory
@@ -461,6 +461,23 @@ def _ydl_opts(extra=None):
         opts.update(extra)
     return opts
 
+def _is_termux():
+    return Path("/data/data/com.termux").exists()
+
+# Resolve yt-dlp to an ABSOLUTE path once at import time. Relying on mpv's
+# inherited PATH to find a bare "yt-dlp" can silently fail in some Termux
+# setups (e.g. pip --user installs landing in a dir not on PATH for
+# subprocesses), and mpv's ytdl_hook fails quietly when that happens —
+# indistinguishable from any other early exit unless you go looking.
+YTDLP_PATH = shutil.which("yt-dlp") or "yt-dlp"
+if YTDLP_PATH == "yt-dlp" and not shutil.which("yt-dlp"):
+    log.warning(
+        "yt-dlp executable not found on PATH — mpv's ytdl_hook will fail. "
+        "Run: pip install -U yt-dlp --break-system-packages"
+    )
+else:
+    log.info(f"using yt-dlp at: {YTDLP_PATH}")
+
 def _mpv_ytdl_args(video_id):
     """
     Build the mpv args needed to let mpv's own yt-dlp integration
@@ -469,21 +486,26 @@ def _mpv_ytdl_args(video_id):
     IMPORTANT: earlier versions of this app pre-resolved a raw stream URL
     in Python (via yt_dlp.extract_info) and handed that bare URL to mpv.
     That raw URL is frequently a fragmented/DASH stream that isn't
-    playable standalone — mpv would open it and die almost immediately
-    (logs showed "resolved top-level url" followed by mpv exiting with
-    code=2 after ~2s on every track). Instead, we hand mpv the actual
-    youtube.com watch URL and let ytdl_hook + yt-dlp pick a properly
-    playable single-file format themselves — this is the same path that
-    worked in manual testing once ytdl_hook was pointed at system yt-dlp
-    instead of mpv's bundled (often outdated) youtube-dl.
+    playable standalone — mpv would open it and die almost immediately.
+    Instead, we hand mpv the actual youtube.com watch URL and let
+    ytdl_hook + yt-dlp pick a properly playable single-file format
+    themselves, using an absolute path to yt-dlp so mpv can't fail to
+    find it silently.
     """
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     args = [
-        "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+        f"--script-opts=ytdl_hook-ytdl_path={YTDLP_PATH}",
         "--ytdl-format=bestaudio/best",
     ]
     if COOKIES_FILE.exists():
         args.append(f"--ytdl-raw-options=cookies={COOKIES_FILE}")
+    # Termux/Android has no PulseAudio/ALSA — mpv's "auto" audio-output
+    # probing can fail there, which produces the exact symptom you saw:
+    # every track dying after ~2-3s (roughly the extraction time) with
+    # exit code 2 regardless of which video it is. Force the Android
+    # audio backend explicitly on Termux.
+    if _is_termux():
+        args.append("--ao=audiotrack")
     args.append(watch_url)
     return args
 
@@ -596,10 +618,14 @@ def play_track(track):
             f"--volume={state['volume']}",
             f"--input-ipc-server={sock_path}",
         ] + _mpv_ytdl_args(track["video_id"])
+        # Merge stdout+stderr: mpv/ytdl_hook write some error text to
+        # stdout depending on message type, and discarding stdout meant
+        # we were losing the actual error — every crash logged an empty
+        # tail. Capturing both together guarantees we see it.
         player_proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
         )
         state["playing"] = True
@@ -640,16 +666,19 @@ def _watcher(serial):
     if not proc:
         return
 
-    # Use communicate() (not wait()) since stderr is now a PIPE — wait()
-    # alone can deadlock once the OS pipe buffer fills up.
+    # Use communicate() (not wait()) since output is now piped — wait()
+    # alone can deadlock once the OS pipe buffer fills up. stderr is
+    # merged into stdout (see Popen call above), so combined_output has
+    # everything mpv/ytdl_hook printed, regardless of which stream it
+    # actually used.
     try:
-        _, stderr_output = proc.communicate()
+        combined_output, _ = proc.communicate()
     except Exception:
         try:
             proc.wait()
         except Exception:
             pass
-        stderr_output = ""
+        combined_output = ""
 
     with play_lock:
         if play_serial != serial: return
@@ -661,7 +690,9 @@ def _watcher(serial):
     if returncode != 0 or elapsed < MIN_HEALTHY_PLAYBACK_SECONDS:
         # Real failure: nonzero exit, or exited suspiciously fast (silent
         # failure pattern — mpv opened the URL and died with no audio).
-        tail = (stderr_output or "").strip()[-500:]
+        tail = (combined_output or "").strip()[-800:]
+        if not tail:
+            tail = "(mpv produced no output at all — check mpv is actually installed and on PATH)"
         log.error(
             f"mpv exited abnormally (code={returncode}, after {elapsed:.1f}s): {tail}"
         )
