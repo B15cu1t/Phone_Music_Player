@@ -491,21 +491,33 @@ def _mpv_ytdl_args(video_id):
     ytdl_hook + yt-dlp pick a properly playable single-file format
     themselves, using an absolute path to yt-dlp so mpv can't fail to
     find it silently.
+
+    Two things confirmed by direct terminal testing were required beyond
+    that:
+    - yt-dlp needs `remote-components=ejs:github` enabled, or its newer
+      signature-solving step silently skips protected formats and often
+      reports videos as "unavailable" when they aren't.
+    - This mpv build has no `audiotrack` audio output at all (confirmed
+      via `mpv --ao=help`) — Termux/Android needs `--ao=opensles`
+      (OpenSL ES) instead, which was verified to actually produce sound.
     """
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    raw_opts = ["remote-components=ejs:github"]
+    if COOKIES_FILE.exists():
+        raw_opts.append(f"cookies={COOKIES_FILE}")
+
     args = [
         f"--script-opts=ytdl_hook-ytdl_path={YTDLP_PATH}",
         "--ytdl-format=bestaudio/best",
+        f"--ytdl-raw-options={','.join(raw_opts)}",
     ]
-    if COOKIES_FILE.exists():
-        args.append(f"--ytdl-raw-options=cookies={COOKIES_FILE}")
-    # Termux/Android has no PulseAudio/ALSA — mpv's "auto" audio-output
-    # probing can fail there, which produces the exact symptom you saw:
-    # every track dying after ~2-3s (roughly the extraction time) with
-    # exit code 2 regardless of which video it is. Force the Android
-    # audio backend explicitly on Termux.
+    # Termux/Android has no PulseAudio/ALSA/JACK — mpv's "auto" audio
+    # output probing fails there. Confirmed via `mpv --ao=help` that this
+    # build only offers opensles/openal/null/pcm on Android, and opensles
+    # is the one that actually produced audio in testing.
     if _is_termux():
-        args.append("--ao=audiotrack")
+        args.append("--ao=opensles")
     args.append(watch_url)
     return args
 
